@@ -1,0 +1,60 @@
+schema: 1
+name: ecb-fx-rates
+display_name: ECB Reference Rates
+description: >-
+  European Central Bank reference exchange rates, republished per call. The
+  upstream is free and keyless; what is being sold here is the SLA — a stable
+  path, a fixed JSON shape, and a receipt for every call.
+maintainer:
+  github: pristinecake
+status: draft
+network: eip155:2366
+# Quoted on purpose: a bare 0x… is a YAML integer, and the leading digits would
+# be parsed away before the manifest ever sees them.
+pay_to: "0x2F6aB1c0d4E85A39B7c2D9e0F4a1B8c3D6e0A9f2"
+upstream:
+  name: Frankfurter
+  url: https://api.frankfurter.app
+  requires_api_key: false
+  terms_url: https://www.frankfurter.app/docs/
+# The published enum is {go-gin, typescript-express, custom}. This gateway is
+# none of the first two, and there is no `rust-axum` member to claim, so it
+# declares itself custom rather than lying about its template.
+source: custom
+endpoints:
+  - method: GET
+    path: /v1/currencies
+    summary: The currency codes the ECB publishes a reference rate for.
+    price_usd: "0.0005"
+    example_request:
+      query: {}
+    pitfalls:
+      - "This is a directory listing, not a rate. It is priced at the floor because it changes twice a decade."
+  - method: GET
+    path: /v1/latest
+    summary: The most recent reference rates, optionally narrowed to a set of targets.
+    price_usd: "0.001"
+    example_request:
+      query:
+        from: EUR
+        to: USD,GBP,JPY
+    pitfalls:
+      - "`to` takes a comma-separated list; repeating the parameter silently keeps only the last one."
+      - "Rates publish around 16:00 CET on working days. Between Friday's close and Monday's publish, `latest` returns Friday's date."
+      - "The default `from` is EUR. Asking for USD as the base is supported, but it is derived — the ECB itself does not quote it that way."
+  - method: GET
+    path: /v1/timeseries
+    summary: A historical range for one base currency against one or more targets.
+    price_usd: "0.006"
+    example_request:
+      query:
+        start_date: 2026-01-01
+        end_date: 2026-03-31
+        from: EUR
+        to: USD
+    pitfalls:
+      - "Weekends and holidays have no entry at all — the range is sparse, not zero-filled."
+      - "A range that spans a currency's accession date returns nothing before it, without an error."
+      - "Maximum span is not enforced upstream, so an unbounded range is a large response and a slow settle."
+categories: [finance, data]
+tags: [fx, ecb, exchange-rates, reference-data]

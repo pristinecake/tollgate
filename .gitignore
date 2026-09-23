@@ -1,0 +1,10 @@
+# Rust
+/target
+
+# Only used by scripts/check-manifest.mjs, which validates service.yaml against
+# the schema published by gokite-ai/kite-x402-services.
+/node_modules
+
+# Local overrides
+.env
+*.local.yaml

@@ -1,0 +1,15 @@
+{
+  "name": "tollgate-manifest-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Checks service.yaml against the schema published by gokite-ai/kite-x402-services. This is not a build step — the gateway is Rust — it exists so the manifest stays submittable to the official catalog.",
+  "scripts": {
+    "check:manifest": "node scripts/check-manifest.mjs"
+  },
+  "devDependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "yaml": "^2.6.1"
+  }
+}

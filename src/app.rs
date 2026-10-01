@@ -187,6 +187,23 @@ async fn dispatch(State(state): State<Arc<AppState>>, request: Request) -> Respo
     match decision {
         Decision::Free => forward(&state, request, &method, &path, query.as_deref(), None).await,
 
+        Decision::MethodNotAllowed { allowed } => {
+            // The path is for sale under other methods. Say so, with the
+            // manifest's own list — the caller can correct itself instead of
+            // being relayed upstream uncharged.
+            let mut response = json_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                json!({
+                    "error": "method not for sale on this path",
+                    "allowed": allowed,
+                }),
+            );
+            if let Ok(value) = allowed.join(", ").parse() {
+                response.headers_mut().insert(header::ALLOW, value);
+            }
+            response
+        }
+
         Decision::Challenge(challenge) => {
             Meter::bump(&state.meter().challenged);
             challenge_response(&challenge)

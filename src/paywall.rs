@@ -9,6 +9,7 @@
 //!
 //! ```text
 //!   route not priced                     -> Free         (no 402 at all)
+//!   path priced, method not              -> MethodNotAllowed (405 + Allow)
 //!   no PAYMENT-SIGNATURE header          -> Challenge    (402 + quote)
 //!   header that will not decode          -> Challenge    (402 + reason)
 //!   payment that does not cover the price-> Challenge    (402 + reason)
@@ -18,7 +19,12 @@
 //! ```
 //!
 //! `Free` is checked first, so a `/healthz` on a service that also sells data
-//! never accidentally becomes a paid route.
+//! never accidentally becomes a paid route. `MethodNotAllowed` comes second:
+//! a path the manifest prices under `GET` must not become a toll-free lane
+//! just because the caller spelled the method differently — the previous
+//! behaviour handed such requests straight to the upstream, unpaid.
+
+use std::time::Duration;
 
 use crate::chains::Chain;
 use crate::error::{FacilitatorError, ProtocolError};
@@ -34,6 +40,11 @@ use crate::protocol::{
 pub enum Decision {
     /// The route is not for sale. Hand it to the upstream untouched.
     Free,
+
+    /// The path is for sale, but not under this method. A 405 carrying the
+    /// methods the manifest does price, so a well-meaning client can correct
+    /// itself instead of being forwarded upstream for free.
+    MethodNotAllowed { allowed: Vec<String> },
 
     /// Quoting a price. Send the challenge and stop.
     Challenge(Box<PaymentRequired>),
@@ -98,6 +109,19 @@ impl Gate {
             .find(|route| route.method.eq_ignore_ascii_case(method) && route.path == path)
     }
 
+    /// The methods the manifest prices `path` under, in manifest order.
+    ///
+    /// Used to answer a request that named the right path with the wrong
+    /// method: the caller gets a 405 whose `Allow` lists what is actually for
+    /// sale, instead of being relayed upstream uncharged.
+    pub fn methods_for(&self, path: &str) -> Vec<String> {
+        self.routes
+            .iter()
+            .filter(|route| route.path == path)
+            .map(|route| route.method.clone())
+            .collect()
+    }
+
     /// Build the 402 body for `route`.
     pub fn challenge(
         &self,
@@ -136,7 +160,14 @@ impl Gate {
         payment_header: Option<&str>,
     ) -> Decision {
         let Some(route) = self.route_for(method, path) else {
-            return Decision::Free;
+            // A path the manifest prices under another method must not slip
+            // through as Free: that would make a wrong-method request the
+            // cheapest way to reach the upstream.
+            let allowed = self.methods_for(path);
+            if allowed.is_empty() {
+                return Decision::Free;
+            }
+            return Decision::MethodNotAllowed { allowed };
         };
 
         let Some(raw) = payment_header.filter(|raw| !raw.trim().is_empty()) else {
@@ -189,18 +220,46 @@ impl Gate {
 
     /// Settle a verified payment and return the receipt.
     ///
+    /// Transient facilitator failures are retried: the payment was verified,
+    /// the upstream already delivered, and giving up at the first hiccup turns
+    /// a served request into revenue that quietly evaporated. The settle
+    /// payload is an authorization carrying a nonce, so resubmitting the same
+    /// payment cannot spend twice — it either lands or is rejected as a
+    /// replay. Deterministic refusals (4xx, undecodable answers) are not
+    /// retried; only transport failures and facilitator 5xx earn the
+    /// [`SETTLE_BACKOFF`] treatment.
+    ///
     /// # Errors
     ///
     /// [`FacilitatorError`] when the facilitator cannot be reached or refuses
-    /// to answer.
+    /// to answer, after the retries are exhausted.
     pub async fn settle(
         &self,
         payment: &PaymentPayload,
         requirements: &PaymentRequirements,
     ) -> Result<SettleResponse, FacilitatorError> {
-        self.facilitator.settle(payment, requirements).await
+        let mut attempt = 0;
+        loop {
+            match self.facilitator.settle(payment, requirements).await {
+                Ok(receipt) => return Ok(receipt),
+                Err(error) if error.is_retryable() && attempt < SETTLE_BACKOFF.len() => {
+                    tracing::warn!(
+                        attempt,
+                        error = %error,
+                        "settle attempt failed; retrying with the same authorization"
+                    );
+                    tokio::time::sleep(SETTLE_BACKOFF[attempt]).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
+
+/// Pauses before each settle retry. Short, on purpose: the caller is holding a
+/// connection open while we wait.
+const SETTLE_BACKOFF: [Duration; 2] = [Duration::from_millis(150), Duration::from_millis(400)];
 
 /// Whether an upstream response is good enough to charge for.
 ///
@@ -281,10 +340,22 @@ mod tests {
     #[tokio::test]
     async fn the_method_has_to_match() {
         let gate = gate("0.002");
+        let Decision::MethodNotAllowed { allowed } = gate
+            .evaluate("POST", "/v1/thing", "http://x/v1/thing", None)
+            .await
+        else {
+            panic!("expected a method rejection, not a free pass");
+        };
+        assert_eq!(allowed, ["GET"]);
+    }
+
+    #[tokio::test]
+    async fn method_matching_ignores_case() {
+        let gate = gate("0.002");
         assert!(matches!(
-            gate.evaluate("POST", "/v1/thing", "http://x/v1/thing", None)
+            gate.evaluate("get", "/v1/thing", "http://x/v1/thing", None)
                 .await,
-            Decision::Free
+            Decision::Challenge(_)
         ));
     }
 
@@ -380,6 +451,49 @@ mod tests {
         }
         for status in [400, 401, 404, 429, 500, 502, 503] {
             assert!(!should_settle(status), "{status} must not be chargeable");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flaky_facilitator_is_retried_before_giving_up() {
+        // Closed port: every settle attempt is a transport error. The call
+        // must still return (not hang), and it must have taken at least the
+        // two backoff pauses — the proof that the retries actually happened.
+        let gate = gate("0.002");
+        let started = std::time::Instant::now();
+        let result = gate
+            .settle(
+                &payment_for(gate.routes()[0].requirements.clone()),
+                &gate.routes()[0].requirements,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() >= SETTLE_BACKOFF[0] + SETTLE_BACKOFF[1],
+            "gave up after {:?}, before the backoffs elapsed",
+            started.elapsed()
+        );
+    }
+
+    /// A payment payload that satisfies `requirements` structurally.
+    fn payment_for(requirements: PaymentRequirements) -> PaymentPayload {
+        PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: requirements.clone(),
+            payload: crate::protocol::ExactEvmPayload {
+                authorization: crate::protocol::TransferAuthorization {
+                    from: "0xabcabcabcabcabcabcabcabcabcabcabcabcabca".to_owned(),
+                    to: requirements.pay_to.clone(),
+                    value: requirements.amount.clone(),
+                    valid_after: "0".to_owned(),
+                    valid_before: "9999999999".to_owned(),
+                    nonce: format!("0x{}", "00".repeat(32)),
+                },
+                signature: format!("0x{}", "ab".repeat(65)),
+                authorization_type: None,
+            },
+            extensions: None,
         }
     }
 }

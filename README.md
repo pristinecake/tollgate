@@ -24,8 +24,30 @@ paywall loses money:
   the transfer then did not land, the caller gets a 402 and no payload. Serving
   the body anyway is what turns a paywall into a free proxy.
 
-Both are covered by end-to-end tests that stand up a real server, a real mock
-facilitator, and a real mock upstream (`tests/gateway.rs`).
+A third rule closes a subtler hole:
+
+- **A priced path has no free methods.** If the manifest sells `GET /v1/thing`,
+  a `POST /v1/thing` is not an unpriced route to be relayed for free — it is a
+  405 whose `Allow` lists the methods that are actually for sale. Earlier
+  behaviour forwarded such requests upstream uncharged.
+
+Both money invariants are covered by end-to-end tests that stand up a real
+server, a real mock facilitator, and a real mock upstream (`tests/gateway.rs`).
+
+## Settle retries
+
+Verification happens before the upstream call; settlement happens after it,
+which means a transient facilitator failure at settle time would turn an
+already-served response into revenue that quietly evaporated. `settle` is
+therefore retried — twice, after 150 ms and 400 ms — but only for failures
+that plausibly go away on their own: transport errors and facilitator 5xx.
+A 4xx is the facilitator making a statement about *this* payment and is not
+beaten to death.
+
+Retrying a settle is safe by construction: the payload is a signed
+authorization carrying a nonce, so resubmitting the same payment either lands
+or is rejected as a replay — it cannot spend twice. The end-to-end suite
+asserts that all retry attempts carry byte-identical nonces.
 
 ## Quick start
 
@@ -121,7 +143,7 @@ mismatch is visible locally, so it is caught locally.
 ## Testing
 
 ```bash
-cargo test        # 51 unit, 19 end-to-end, 6 manifest guards, 4 doc tests
+cargo test        # 54 unit, 23 end-to-end, 6 manifest guards, 4 doc tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -134,6 +156,10 @@ reaches into the paywall directly. Among other things it asserts that:
 - a 503 from the upstream results in zero calls to `/settle`;
 - a payment to the wrong wallet is refused without waking the facilitator;
 - a settlement that fails does not put the payload on the wire;
+- a wrong-method request on a priced path never reaches the upstream, paid or
+  not;
+- a facilitator that fails `/settle` twice with a 500 is retried, and all
+  attempts carry the same authorization nonce;
 - no header containing `payment` ever reaches the upstream, because a relayed
   authorization is a bearer instrument for the payer's money.
 

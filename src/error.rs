@@ -134,6 +134,27 @@ pub enum FacilitatorError {
     },
 }
 
+impl FacilitatorError {
+    /// Whether a second attempt could succeed where this one failed.
+    ///
+    /// Transport failures (connection refused, reset, timeout) are classic
+    /// transients. A 5xx from the facilitator means "I am having trouble",
+    /// which also earns a retry — the settle payload is an authorization with
+    /// a nonce, so a re-submission of the *same* payment cannot spend twice;
+    /// it either lands or is rejected as a replay. A 4xx is the facilitator
+    /// making a statement about *this* payment, and a decode error means we
+    /// did get an answer we failed to understand: both are deterministic, and
+    /// repeating them is just a slower way to fail.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport { .. } => true,
+            Self::Status { status, .. } => (500..600).contains(status),
+            Self::Decode { .. } => false,
+        }
+    }
+}
+
 /// Failure while relaying the request to the upstream API.
 #[derive(Debug, Error)]
 pub enum UpstreamError {
@@ -146,4 +167,34 @@ pub enum UpstreamError {
 
     #[error("upstream returned {status} for {url}")]
     Status { url: String, status: u16 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_and_5xx_are_retryable_4xx_and_decode_are_not() {
+        // The Transport branch cannot be constructed here (reqwest keeps its
+        // error constructor private); the closed-port tests in paywall.rs
+        // exercise it with the real thing.
+
+        for status in [500u16, 502, 503, 599] {
+            let server_error = FacilitatorError::Status {
+                operation: "settle",
+                status,
+                body: "<empty body>".to_owned(),
+            };
+            assert!(server_error.is_retryable(), "{status} should retry");
+        }
+
+        for status in [400u16, 401, 404, 429] {
+            let caller_error = FacilitatorError::Status {
+                operation: "settle",
+                status,
+                body: "<empty body>".to_owned(),
+            };
+            assert!(!caller_error.is_retryable(), "{status} must not retry");
+        }
+    }
 }

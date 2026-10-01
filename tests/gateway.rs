@@ -358,6 +358,57 @@ async fn a_path_the_manifest_does_not_price_is_not_gated() {
     assert_eq!(harness.facilitator_hits("/verify").await, 0);
 }
 
+#[tokio::test]
+async fn a_wrong_method_on_a_priced_path_is_refused_not_relayed() {
+    let harness = Harness::start().await;
+    harness
+        .upstream_says("/forecast", 200, r#"{"leaked":true}"#)
+        .await;
+
+    let response = harness
+        .client
+        .post(format!("{}/v1/forecast", harness.origin))
+        .send()
+        .await
+        .expect("the gateway answers");
+
+    // The manifest sells GET on this path. A POST is not a free lane to the
+    // same upstream handler — that was the old behaviour, and it was a hole.
+    assert_eq!(response.status(), 405);
+    assert_eq!(response.headers()["allow"], "GET");
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["allowed"], json!(["GET"]));
+
+    assert_eq!(harness.upstream_hits().await, 0, "nothing was relayed");
+    assert_eq!(harness.facilitator_hits("/verify").await, 0);
+    assert_eq!(harness.facilitator_hits("/settle").await, 0);
+}
+
+#[tokio::test]
+async fn a_paid_wrong_method_never_settles() {
+    let harness = Harness::start().await;
+    harness.verify_says(verified()).await;
+    harness
+        .upstream_says("/forecast", 200, r#"{"leaked":true}"#)
+        .await;
+
+    let requirements = harness.quote("/v1/forecast").await;
+    let response = harness
+        .client
+        .post(format!("{}/v1/forecast", harness.origin))
+        .header("PAYMENT-SIGNATURE", pay_for(&requirements))
+        .send()
+        .await
+        .expect("the gateway answers");
+
+    // Even with money attached: the method is not for sale, so nothing is
+    // charged and nothing is served.
+    assert_eq!(response.status(), 405);
+    assert_eq!(harness.facilitator_hits("/verify").await, 0);
+    assert_eq!(harness.facilitator_hits("/settle").await, 0);
+    assert_eq!(harness.upstream_hits().await, 0);
+}
+
 // ---------------------------------------------------------------------------
 // The quote
 // ---------------------------------------------------------------------------
@@ -770,6 +821,97 @@ async fn a_settlement_that_fails_withholds_the_data() {
     // The call was made and wasted. That is the cost of settling after the
     // fact, and it is cheaper than charging for nothing.
     assert_eq!(harness.upstream_hits().await, 1);
+}
+
+#[tokio::test]
+async fn a_flaky_settle_is_retried_before_the_caller_sees_anything() {
+    // verify passes, the upstream answers, and then the facilitator hiccups:
+    // two 500s before the settle lands. The caller must still get the data and
+    // the receipt — revenue is not allowed to evaporate on a transient.
+    let harness = Harness::start().await;
+    harness.verify_says(verified()).await;
+    harness
+        .upstream_says(
+            "/forecast",
+            200,
+            r#"{"temperature":18.5,"secret":"paid data"}"#,
+        )
+        .await;
+
+    // Mounted in order: the failing mock exhausts itself first, then the
+    // persistent one takes over. wiremock serves them in mounting order.
+    Mock::given(method("POST"))
+        .and(path("/settle"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("try again"))
+        .up_to_n_times(2)
+        .mount(&harness.facilitator)
+        .await;
+    harness.settle_says(settled()).await;
+
+    let requirements = harness.quote("/v1/forecast").await;
+    let response = harness
+        .client
+        .get(format!("{}/v1/forecast", harness.origin))
+        .header("PAYMENT-SIGNATURE", pay_for(&requirements))
+        .send()
+        .await
+        .expect("the gateway answers");
+
+    assert_eq!(response.status(), 200, "the retries saved the call");
+    assert_eq!(
+        harness.facilitator_hits("/settle").await,
+        3,
+        "two failures, one success"
+    );
+
+    // All three settle attempts carry the SAME authorization: the nonce makes
+    // a resubmission either land or replay-reject, never spend twice.
+    let bodies = harness.facilitator_bodies("/settle").await;
+    let nonces: Vec<&str> = bodies
+        .iter()
+        .map(|b| {
+            b["paymentPayload"]["payload"]["authorization"]["nonce"]
+                .as_str()
+                .unwrap_or("?")
+        })
+        .collect();
+    assert_eq!(nonces.len(), 3);
+    assert!(
+        nonces.windows(2).all(|pair| pair[0] == pair[1]),
+        "same nonce each time"
+    );
+}
+
+#[tokio::test]
+async fn a_deterministically_refused_settle_is_not_beaten_to_death() {
+    // A 400 is the facilitator making a statement about this payment. Retrying
+    // it is just a slower way to hear the same answer, so exactly one call.
+    let harness = Harness::start().await;
+    harness.verify_says(verified()).await;
+    harness
+        .upstream_says("/forecast", 200, r#"{"temperature":18.5}"#)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/settle"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .mount(&harness.facilitator)
+        .await;
+
+    let requirements = harness.quote("/v1/forecast").await;
+    let response = harness
+        .client
+        .get(format!("{}/v1/forecast", harness.origin))
+        .header("PAYMENT-SIGNATURE", pay_for(&requirements))
+        .send()
+        .await
+        .expect("the gateway answers");
+
+    assert_eq!(response.status(), 502);
+    assert_eq!(
+        harness.facilitator_hits("/settle").await,
+        1,
+        "no retry on a 4xx"
+    );
 }
 
 // ---------------------------------------------------------------------------

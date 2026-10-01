@@ -72,6 +72,10 @@ struct Cli {
     /// Validate the manifest and print the price list, then exit.
     #[arg(long)]
     check: bool,
+
+    /// Validate the manifest and print a machine-readable route report, then exit.
+    #[arg(long)]
+    check_json: bool,
 }
 
 fn main() -> ExitCode {
@@ -110,8 +114,12 @@ fn run(cli: Cli) -> Result<(), String> {
         .priced_routes(chain)
         .map_err(|error| error.to_string())?;
 
-    if cli.check {
-        print_prices(&manifest, chain, &routes);
+    if cli.check || cli.check_json {
+        if cli.check_json {
+            print_prices_json(&manifest, chain, &routes);
+        } else {
+            print_prices(&manifest, chain, &routes);
+        }
         return Ok(());
     }
 
@@ -150,6 +158,28 @@ fn run(cli: Cli) -> Result<(), String> {
     runtime
         .block_on(serve(state, cli.listen))
         .map_err(|error| format!("server stopped: {error}"))
+}
+
+fn print_prices_json(manifest: &Manifest, chain: &chains::Chain, routes: &[tollgate::PricedRoute]) {
+    let routes: Vec<_> = routes
+        .iter()
+        .map(|route| serde_json::json!({
+            "method": route.method,
+            "path": route.path,
+            "priceUsd": route.price_usd,
+            "amountAtomic": route.amount,
+        }))
+        .collect();
+    println!(
+        "{}",
+        serde_json::json!({
+            "service": manifest.name,
+            "network": chain.network,
+            "asset": chain.stablecoin.symbol,
+            "payTo": manifest.pay_to,
+            "routes": routes,
+        })
+    );
 }
 
 fn print_prices(manifest: &Manifest, chain: &chains::Chain, routes: &[tollgate::PricedRoute]) {

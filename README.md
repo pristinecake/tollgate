@@ -57,6 +57,9 @@ cargo build --release
 # Validate the manifest, price every endpoint, and exit.
 ./target/release/tollgate --manifest service.yaml --check
 
+# Same manifest report for deployment tooling / CI
+./target/release/tollgate --manifest service.yaml --check-json
+
 # Serve it.
 ./target/release/tollgate --manifest service.yaml --listen 0.0.0.0:8080
 ```
